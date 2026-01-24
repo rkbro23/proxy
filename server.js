@@ -5,53 +5,43 @@ const cluster = require('cluster');
 const os = require('os');
 const https = require('https');
 const http = require('http');
+const url = require('url'); // Needed for path resolution
 
 const PORT = process.env.PORT || 8080;
-const TIMEOUT_MS = 20000; // Increased to 20s for slow CDNs
-const MAX_REDIRECTS = 15; // Increased for deep redirects
+const TIMEOUT_MS = 20000;
+const MAX_REDIRECTS = 15;
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1000, maxFreeSockets: 100 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 1000, maxFreeSockets: 100 });
 
 if (cluster.isPrimary) {
     const numCPUs = os.cpus().length;
-    console.log(`🔥 PROXY GOD MODE: Master ${process.pid} is running`);
+    console.log(`🔥 MANIFEST REWRITER ACTIVE: Master ${process.pid} is running`);
     
     for (let i = 0; i < numCPUs; i++) {
         cluster.fork();
     }
 
-    // FIX: CRASH LOOP PREVENTION
     cluster.on('exit', (worker, code, signal) => {
-        console.log(`⚠️ Worker ${worker.process.pid} died (Code: ${code}). Respawning in 5s...`);
-        // Add delay to prevent CPU-hogging fork bombs
+        console.log(`⚠️ Worker ${worker.process.pid} died. Respawning in 5s...`);
         setTimeout(() => cluster.fork(), 5000);
     });
 
 } else {
     const app = express();
 
-    // FIX: RETRY LOGIC
-    // Don't retry blindly on large media chunks if they timeout halfway, only on connection errors
     axiosRetry(axios, { 
         retries: 3,
         retryDelay: axiosRetry.exponentialDelay,
-        retryCondition: (error) => {
-            return axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ECONNABORTED';
-        }
+        retryCondition: (error) => axiosRetry.isNetworkOrIdempotentRequestError(error)
     });
 
     app.use((req, res, next) => {
         res.header('Access-Control-Allow-Origin', '*');
         res.header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-        // FIX: Add Range to allowed headers
         res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
-        // FIX: Expose Content-Range for players to see duration
         res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Type, Content-Range, Accept-Ranges');
-        
-        if (req.method === 'OPTIONS') {
-            return res.sendStatus(200);
-        }
+        if (req.method === 'OPTIONS') return res.sendStatus(200);
         next();
     });
 
@@ -66,10 +56,7 @@ if (cluster.isPrimary) {
             <style>
                 body { margin: 0; background: #000; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
                 video { width: 100%; height: 100%; max-height: 100vh; }
-                .watermark {
-                    position: absolute; top: 20px; left: 20px; color: rgba(255, 255, 255, 0.3);
-                    font-family: Arial, sans-serif; font-weight: bold; font-size: 18px; pointer-events: none; z-index: 99; text-transform: uppercase;
-                }
+                .watermark { position: absolute; top: 20px; left: 20px; color: rgba(255,255,255,0.3); font-family: Arial; font-weight: bold; pointer-events: none; z-index: 99; }
             </style>
             <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         </head>
@@ -92,41 +79,33 @@ if (cluster.isPrimary) {
     `;
 
     app.get('/*', async (req, res) => {
-        // FIX: URL & QUERY PRESERVATION
-        // 1. Get the full raw URL after the first /
         let rawRequest = req.url.slice(1); 
-        
-        // 2. Check if "raw=true" exists (internal flag)
         const wantsRaw = rawRequest.includes('raw=true');
-        
-        // 3. Clean "raw=true" from the target URL so upstream doesn't choke on it
-        // We use regex to safely remove ?raw=true or &raw=true
         let targetUrl = rawRequest.replace(/[?&]raw=true/, '');
-        
-        // 4. Handle edge case where replacing left a dangling '?' or '&' at the end is rare but okay, 
-        // normally clean-up not strictly needed for browsers, but good for signed URLs.
 
         if (!targetUrl || !targetUrl.startsWith('http')) {
             if (targetUrl.includes('favicon')) return res.status(404).end();
             return res.status(400).json({ error: 'Invalid URL' });
         }
 
-        // --- PLAYER INTERCEPT ---
-        const isBrowser = req.headers.accept && req.headers.accept.includes('text/html');
+        // Detect if this is an M3U8 Request
         const isM3u8 = targetUrl.includes('.m3u8');
+        const isBrowser = req.headers.accept && req.headers.accept.includes('text/html');
 
+        // 1. Serve Player if Browser + M3U8 + No Raw Flag
         if (isBrowser && isM3u8 && !wantsRaw) {
-            console.log(`[Worker ${process.pid}] 📺 Serving Player: ${targetUrl}`);
-            // Append raw=true to the CURRENT url, not the target, to reload this proxy in "raw" mode
             const playerSrc = req.originalUrl + (req.originalUrl.includes('?') ? '&raw=true' : '?raw=true');
             res.setHeader('Content-Type', 'text/html');
             return res.send(getHtmlPlayer(playerSrc));
         }
 
-        console.log(`[Worker ${process.pid}] ⚡ Proxying: ${targetUrl}`);
+        console.log(`[Worker ${process.pid}] ⚡ Request: ${targetUrl}`);
 
         try {
-            // FIX: HEADER FORWARDING (RANGE SUPPORT)
+            // 2. FETCH DATA
+            // If it is an M3U8, we need 'text' to rewrite it. If it's video (TS), we need 'stream'.
+            const responseType = isM3u8 ? 'text' : 'stream';
+
             const headers = {
                 'User-Agent': 'OTT Navigator/1.6.9.4 (Android)',
                 'Referer': 'https://allinonereborn.com',
@@ -134,71 +113,78 @@ if (cluster.isPrimary) {
                 'Accept': '*/*',
                 'Connection': 'keep-alive'
             };
-
-            // Important: Forward the Range header if the client asked for it (Seeking)
-            if (req.headers.range) {
-                headers['Range'] = req.headers.range;
-            }
+            if (req.headers.range) headers['Range'] = req.headers.range;
 
             const response = await axios.get(targetUrl, {
-                headers: headers,
-                responseType: 'stream',
+                headers,
+                responseType: responseType, // Dynamic Type
                 maxRedirects: MAX_REDIRECTS,
                 timeout: TIMEOUT_MS,
                 httpAgent: httpAgent,
                 httpsAgent: httpsAgent,
                 decompress: false,
-                validateStatus: (status) => status < 400 // Accept 200 and 206
+                validateStatus: (status) => status < 400
             });
 
-            // FIX: RESPONSE HEADERS
-            // Explicitly handle partial content (206) vs standard (200)
-            res.status(response.status);
-
-            let contentType = response.headers['content-type'];
-            if (targetUrl.includes('.m3u8')) contentType = 'application/vnd.apple.mpegurl';
-            else if (targetUrl.includes('.ts')) contentType = 'video/MP2T';
-
-            res.setHeader('Content-Type', contentType || 'application/octet-stream');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.removeHeader('Content-Disposition');
-
-            // Forward critical headers for VOD/Seek
-            const headersToForward = [
-                'content-length', 
-                'content-range', 
-                'accept-ranges', 
-                'content-encoding', 
-                'cache-control', 
-                'last-modified'
-            ];
-
-            Object.entries(response.headers).forEach(([key, value]) => {
-                if (headersToForward.includes(key.toLowerCase())) {
-                    res.setHeader(key, value);
+            // 3. HANDLE M3U8 REWRITING (The Magic Fix)
+            if (isM3u8) {
+                // Determine the "Folder" of the target URL to resolve relative paths
+                // e.g. Target: http://site.com/live/stream.m3u8 -> Base: http://site.com/live/
+                const targetBaseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+                
+                let m3u8Content = response.data;
+                if (typeof m3u8Content !== 'string') {
+                    m3u8Content = m3u8Content.toString(); // Safety catch
                 }
-            });
 
-            // Ensure we tell clients we accept ranges (even if upstream didn't explicitly say so, though risky, usually good for players)
-            if (!res.getHeader('Accept-Ranges')) {
-                res.setHeader('Accept-Ranges', 'bytes');
+                // Rewrite every line
+                const rewrittenM3u8 = m3u8Content.split('\n').map(line => {
+                    const trimmed = line.trim();
+                    // Ignore comments and empty lines
+                    if (!trimmed || trimmed.startsWith('#')) return line;
+
+                    // It's a file path! Resolve it.
+                    let absoluteUrl;
+                    if (trimmed.startsWith('http')) {
+                        absoluteUrl = trimmed; // Already absolute
+                    } else {
+                        absoluteUrl = url.resolve(targetBaseUrl, trimmed); // Make relative absolute
+                    }
+
+                    // Wrap it in our Proxy URL
+                    // We point it back to THIS server: /http://site.com/segment.ts
+                    return `${req.protocol}://${req.headers.host}/${absoluteUrl}`;
+                }).join('\n');
+
+                // Send Rewritten M3U8
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.send(rewrittenM3u8);
+                return;
             }
 
-            response.data.pipe(res);
-
-            req.on('close', () => {
-                if (response.data) response.data.destroy();
+            // 4. HANDLE NORMAL STREAMS (TS, MP4) - Zero Copy Pipe
+            res.status(response.status);
+            
+            // Forward Headers
+            const headersToForward = ['content-length', 'content-range', 'accept-ranges', 'content-type'];
+            Object.entries(response.headers).forEach(([key, value]) => {
+                if (headersToForward.includes(key.toLowerCase())) res.setHeader(key, value);
             });
+            
+            // Force Correct Content Type for TS files
+            if (targetUrl.includes('.ts')) res.setHeader('Content-Type', 'video/MP2T');
+            
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.removeHeader('Content-Disposition');
+            
+            response.data.pipe(res);
+            req.on('close', () => response.data.destroy && response.data.destroy());
 
         } catch (error) {
             const status = error.response?.status || 500;
-            // Only log non-404 errors to keep logs clean
-            if (status !== 404) {
-                console.error(`[Worker ${process.pid}] ❌ Error ${status}: ${targetUrl.substring(0, 50)}...`);
-            }
-            if (!res.headersSent) {
-                res.status(status).end();
-            }
+            if (status !== 404) console.error(`[Worker ${process.pid}] ❌ Error: ${error.message}`);
+            if (!res.headersSent) res.status(status).end();
         }
     });
 
