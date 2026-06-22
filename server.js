@@ -64,7 +64,7 @@ if (cluster.isPrimary) {
             <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         </head>
         <body>
-            <div class="watermark">M3U PLAYLIST</div>
+            <div class="watermark">RK</div>
             <video id="video" controls autoplay></video>
             <script>
                 var video = document.getElementById('video');
@@ -112,12 +112,13 @@ if (cluster.isPrimary) {
         try {
             // 2. PREPARE HEADERS (Using your new TiviMate setup)
             const headers = {
-                'User-Agent': 'Dalvik/2.1.0 (Linux; Android 10; TiviMate/4.1.0)', // Updated UA
-                'Referer': 'https://allinonereborn.xyz', // Updated Domain
-                'Origin': 'https://allinonereborn.xyz',
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
+    'User-Agent': 'ReactNativeVideo/9.7.0 (Linux;Android 10) AndroidXMedia3/1.6.1',
+    'Referer': 'https://fancode.com/',
+    'Origin': 'https://fancode.com',
+    'Accept': '*/*',
+    'Connection': 'keep-alive'
             };
+            
             if (req.headers.range) headers['Range'] = req.headers.range;
 
             const responseType = isM3u8 ? 'text' : 'stream';
